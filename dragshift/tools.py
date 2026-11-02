@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QColorDialog, QComboBox,
 
 from . import imaging
 from .util import ui_family
-from .convert import open_image, open_preview
+from .convert import crop_video, open_image, open_preview, video_preview
 from .glass import pil_from_qimage, qimage_from_pil
 from .util import file_size, human_size, sibling
 from .window import GlassWindow, ImageView
@@ -278,16 +278,11 @@ class CropWindow(ToolWindow):
     RATIOS = [("Free", None), ("Original", "orig"), ("1:1", 1.0), ("4:3", 4 / 3), ("3:2", 1.5),
               ("16:9", 16 / 9), ("9:16", 9 / 16), ("4:5", 0.8)]
 
+    heading = "Crop Image"
+
     def __init__(self, path, notify):
-        super().__init__("Crop Image", path, notify)
-        pv = open_preview(path, 1400)
-        with Image.open(path) as im:
-            fw, fh = im.size
-        from PIL import ImageOps
-        with Image.open(path) as im:
-            o = im.getexif().get(0x0112, 1)
-        if o in (5, 6, 7, 8):
-            fw, fh = fh, fw
+        super().__init__(self.heading, path, notify)
+        pv, (fw, fh) = self.load(path)
         self.full_size = (fw, fh)
         self.rot = 0
         self.base = pv
@@ -325,6 +320,22 @@ class CropWindow(ToolWindow):
         self.view.changed.connect(self._to_spin)
         self._to_spin()
         self.body.addLayout(self.footer("Apply", self.apply, self.reset))
+
+    def load(self, path):
+        """Preview image and full upright size."""
+        pv = open_preview(path, 1400)
+        with Image.open(path) as im:
+            fw, fh = im.size
+            o = im.getexif().get(0x0112, 1)
+        if o in (5, 6, 7, 8):
+            fw, fh = fh, fw
+        return pv, (fw, fh)
+
+    def crop(self, path, box, rot) -> list:
+        im = open_image(path)
+        if rot:
+            im = im.rotate(-rot, expand=True)
+        return [imaging.save_like(im.crop(box), path, "Cropped")]
 
     def _ratio(self, i):
         r = self.RATIOS[i][1]
@@ -394,14 +405,18 @@ class CropWindow(ToolWindow):
                 w = fw - x0
                 h = round(w / r)
         box = (x0, y0, x0 + w, y0 + h)
-
-        def work():
-            im = open_image(path)
-            if rot:
-                im = im.rotate(-rot, expand=True)
-            return [imaging.save_like(im.crop(box), path, "Cropped")]
         extra = f"rotated {rot}°" if rot else ""
-        self.run(work, "Cropping…", extra)
+        self.run(lambda: self.crop(path, box, rot), "Cropping…", extra)
+
+
+class VideoCropWindow(CropWindow):
+    heading = "Crop Video"
+
+    def load(self, path):
+        return video_preview(path, 1400)
+
+    def crop(self, path, box, rot) -> list:
+        return [crop_video(path, box, rot)]
 
 
 # ================================================================ ADD BG
