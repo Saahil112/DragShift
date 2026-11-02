@@ -47,6 +47,7 @@ FORMAT_HINTS = {"JPG": "Small, universal", "PNG": "Lossless · transparency", "W
 
 IMAGE_TOOLS = ["Compress", "Resize", "Crop", "Edit", "Annotate", "Redact", "Add BG", "Metadata"]
 PDF_TOOLS = ["Compress", "Split", "Rotate", "Protect", "Extract", "Metadata"]
+VIDEO_TOOLS = ["Crop"]
 
 
 # ---------------------------------------------------------------- background jobs
@@ -244,6 +245,8 @@ class DragShiftApp(QObject):
             hint = FORMAT_HINTS.get(t, "")
             if cat == "image" and t == "PDF" and len(same) > 1:
                 hint = f"{len(same)} images → 1 PDF"
+            if cat == "video":
+                hint = "Looping animation"
             convert_items.append(Item(t, key=f"convert:{t}", hint=hint))
         rings: dict[str, list[Item]] = {"Convert": convert_items}
         if cat == "image":
@@ -251,6 +254,8 @@ class DragShiftApp(QObject):
         elif cat == "pdf":
             names = PDF_TOOLS[:3] + (["Merge"] if len(same) > 1 else []) + PDF_TOOLS[3:]
             rings["Tools"] = [Item(n, GLYPHS[n], key=f"tool:{n}", hint=HINTS[n]) for n in names]
+        elif cat == "video":
+            rings["Tools"] = [Item(n, GLYPHS[n], key=f"tool:{n}", hint=HINTS[n]) for n in VIDEO_TOOLS]
         return rings
 
     # ------------------------------------------------------------ actions
@@ -282,7 +287,7 @@ class DragShiftApp(QObject):
                             {"Compress": "Compressing…", "Split": "Splitting…", "Rotate": "Rotating…",
                              "Extract": "Extracting images…"}[name])
             return
-        windows = {"Crop": tools.CropWindow, "Add BG": tools.AddBgWindow, "Annotate": tools.AnnotateWindow,
+        windows = {"Crop": tools.VideoCropWindow if cat == "video" else tools.CropWindow, "Add BG": tools.AddBgWindow, "Annotate": tools.AnnotateWindow,
                    "Redact": tools.RedactWindow, "Edit": tools.EditWindow, "Metadata": tools.MetadataWindow}
         try:
             if name == "Compress":
@@ -510,6 +515,17 @@ def selftest() -> int:
             (Path(d) / "n.txt").write_text("hello")
             docx = convert.convert(Path(d) / "n.txt", "text", "DOCX")[0]
             convert.convert(docx, "docx", "TXT")
+            import av
+            import numpy as np
+            mov = Path(d) / "v.mov"
+            with av.open(str(mov), "w") as c:
+                s = c.add_stream("libx264", rate=10)
+                s.width, s.height, s.pix_fmt = 64, 48, "yuv420p"
+                for _ in range(3):
+                    c.mux(s.encode(av.VideoFrame.from_ndarray(np.zeros((48, 64, 3), np.uint8), format="rgb24")))
+                c.mux(s.encode())
+            convert.convert(mov, "video", "GIF")
+            convert.crop_video(mov, (0, 0, 32, 32), 90)
             imaging.add_background(convert.open_image(src), imaging.Background())
             imaging.compress_pdf(pdf)
             imaging.protect_pdf(pdf, "pw")
@@ -521,7 +537,8 @@ def selftest() -> int:
             for w in (tools.CropWindow(str(src), n), tools.AddBgWindow(str(src), n), tools.EditWindow(str(src), n),
                       tools.AnnotateWindow(str(src), n), tools.RedactWindow(str(src), n),
                       tools.MetadataWindow(str(src), n), tools.CompressWindow([str(src)], n),
-                      tools.ResizeWindow([str(src)], n), tools.ProtectWindow(str(pdf), n)):
+                      tools.ResizeWindow([str(src)], n), tools.ProtectWindow(str(pdf), n),
+                      tools.VideoCropWindow(str(mov), n)):
                 w.close()
             ToastStack().info("ok", "ok").dismiss()
             check_text_renders()

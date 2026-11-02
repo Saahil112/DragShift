@@ -27,6 +27,7 @@ IMAGE_TARGETS = ["PNG", "JPG", "WEBP", "HEIC", "TIFF", "AVIF", "BMP", "PDF", "IC
 PDF_TARGETS = ["JPG", "PNG", "DOCX", "TXT"]
 DOCX_TARGETS = ["PDF", "TXT"]
 TEXT_TARGETS = ["PDF", "DOCX"]
+VIDEO_TARGETS = ["GIF"]
 
 PIL_FORMAT = {"PNG": "PNG", "JPG": "JPEG", "WEBP": "WEBP", "HEIC": "HEIF", "TIFF": "TIFF",
               "AVIF": "AVIF", "BMP": "BMP", "PDF": "PDF", "ICO": "ICO", "GIF": "GIF"}
@@ -352,6 +353,129 @@ def text_to_docx(src: str | Path) -> list[Path]:
     return [out]
 
 
+# ---------------------------------------------------------------- video
+GIF_FPS = 15
+GIF_MAX_SIDE = 640
+GIF_MAX_FRAMES = 300  # long clips get a lower frame rate instead of a gigantic GIF
+
+
+def open_video(path: str | Path):
+    import av
+    try:
+        c = av.open(str(path))
+    except av.FFmpegError:
+        raise UserError("This video can't be read. It may be damaged or use an unusual codec.")
+    if not c.streams.video:
+        c.close()
+        raise UserError("This file has no video track.")
+    c.streams.video[0].thread_type = "AUTO"
+    return c
+
+
+def _turns(frame, rot: int = 0) -> int:
+    """Quarter turns (counter-clockwise, for np.rot90) that show `frame` upright, then turn it
+    `rot`° clockwise. Phones store portrait clips sideways plus a rotation flag."""
+    return (round((frame.rotation or 0) / 90) - rot // 90) % 4
+
+
+def video_frames(path: str | Path, fps: float | None = None):
+    """Yield (seconds, upright RGB array), thinned to at most `fps` frames a second."""
+    import numpy as np
+    with open_video(path) as c:
+        nxt = 0.0
+        for f in c.decode(c.streams.video[0]):
+            t = f.time if f.time is not None else nxt
+            if fps:
+                if t + 1e-6 < nxt:
+                    continue
+                while nxt <= t + 1e-6:
+                    nxt += 1 / fps
+            yield t, np.rot90(f.to_ndarray(format="rgb24"), _turns(f))
+
+
+def video_preview(path: str | Path, max_side: int = 1400) -> tuple[Image.Image, tuple[int, int]]:
+    """First frame (reduced for on-screen use) and the video's upright full size."""
+    for _, arr in video_frames(path):
+        im = Image.fromarray(arr)
+        full = im.size
+        im.thumbnail((max_side, max_side), Image.LANCZOS)
+        return im, full
+    raise UserError("This video has no frames.")
+
+
+def video_to_gif(src: str | Path) -> list[Path]:
+    with open_video(src) as c:
+        secs = (c.duration or 0) / 1_000_000
+    fps = min(GIF_FPS, GIF_MAX_FRAMES / secs) if secs else GIF_FPS
+
+    def frames():
+        for i, (t, arr) in enumerate(video_frames(src, fps)):
+            if i >= GIF_MAX_FRAMES:
+                return
+            im = Image.fromarray(arr)
+            im.thumbnail((GIF_MAX_SIDE, GIF_MAX_SIDE), Image.LANCZOS)
+            yield t, im
+
+    # pass 1: one palette for the whole clip (per-frame palettes flicker)
+    samples = [im for i, (_, im) in enumerate(frames()) if i % 10 == 0]
+    if not samples:
+        raise UserError("This video has no frames.")
+    w, h = samples[0].size
+    sheet = Image.new("RGB", (w, h * len(samples)))
+    for i, im in enumerate(samples):
+        sheet.paste(im, (0, h * i))
+    pal = sheet.quantize(256, method=Image.Quantize.MEDIANCUT)
+    # pass 2: map every frame onto it; frame times come from the video, so slow clips stay slow
+    times, out_frames = [], []
+    for t, im in frames():
+        times.append(t)
+        out_frames.append(im.quantize(palette=pal, dither=Image.Dither.FLOYDSTEINBERG))
+    durs = [max(20, round((b - a) * 1000)) for a, b in zip(times, times[1:])] + [round(1000 / fps)]
+    out = sibling(src, ext=".gif")
+    atomic_save(lambda dst: out_frames[0].save(dst, "GIF", save_all=True, append_images=out_frames[1:],
+                                               duration=durs, loop=0), out)
+    return [out]
+
+
+def crop_video(src: str | Path, box: tuple[int, int, int, int], rot: int = 0) -> Path:
+    """Crop to `box` (upright pixels, after turning `rot`° clockwise). Sound is copied as-is."""
+    import av
+    import numpy as np
+    x0, y0, x1, y1 = box
+    w, h = (x1 - x0) // 2 * 2, (y1 - y0) // 2 * 2  # H.264 needs even sizes
+    ext = ".mp4" if Path(src).suffix.lower() == ".mp4" else ".mov"
+    codec = next(c for c in ("libx264", "h264_videotoolbox", "h264") if c in av.codecs_available)
+
+    def write(dst):
+        with open_video(src) as inp, av.open(str(dst), "w", format=ext[1:]) as out:
+            vin = inp.streams.video[0]
+            ain = inp.streams.audio[0] if inp.streams.audio else None
+            vout = out.add_stream(codec, rate=vin.average_rate or 30)
+            vout.width, vout.height, vout.pix_fmt = w, h, "yuv420p"
+            # keep the source clock: screen recordings are variable-rate, and rounding their
+            # timestamps to the average rate gives two frames the same time
+            vout.time_base = vout.codec_context.time_base = vin.time_base
+            if codec == "libx264":
+                vout.options = {"crf": "18", "preset": "medium"}
+            aout = out.add_stream_from_template(ain) if ain else None
+            for pkt in inp.demux([vin] + ([ain] if ain else [])):
+                if pkt.stream is ain:
+                    if pkt.dts is not None:
+                        pkt.stream = aout
+                        out.mux(pkt)
+                    continue
+                for f in pkt.decode():
+                    arr = np.rot90(f.to_ndarray(format="rgb24"), _turns(f, rot))[y0:y0 + h, x0:x0 + w]
+                    nf = av.VideoFrame.from_ndarray(np.ascontiguousarray(arr), format="rgb24")
+                    nf.pts, nf.time_base = f.pts, f.time_base
+                    out.mux(vout.encode(nf))
+            out.mux(vout.encode())
+
+    out = sibling(src, "Cropped", ext)
+    atomic_save(write, out)
+    return out
+
+
 # ---------------------------------------------------------------- dispatch
 def targets_for(cat: str, src_ext: str) -> list[str]:
     src_ext = src_ext.lower().lstrip(".")
@@ -362,7 +486,8 @@ def targets_for(cat: str, src_ext: str) -> list[str]:
         if not HEIF_OK:
             t = [x for x in t if x != "HEIC"]
         return t
-    return {"pdf": PDF_TARGETS, "docx": DOCX_TARGETS, "text": TEXT_TARGETS}.get(cat, [])
+    return {"pdf": PDF_TARGETS, "docx": DOCX_TARGETS, "text": TEXT_TARGETS,
+            "video": VIDEO_TARGETS}.get(cat, [])
 
 
 def convert(src: str | Path, cat: str, target: str) -> list[Path]:
@@ -380,4 +505,6 @@ def convert(src: str | Path, cat: str, target: str) -> list[Path]:
         return docx_to_pdf(src) if target == "PDF" else docx_to_txt(src)
     if cat == "text":
         return text_to_pdf(src) if target == "PDF" else text_to_docx(src)
+    if cat == "video" and target == "GIF":
+        return video_to_gif(src)
     raise ValueError(f"Can't convert {cat} to {target}")
