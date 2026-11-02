@@ -165,9 +165,13 @@ def autostart_enabled() -> bool:
 def set_autostart(on: bool):
     if on:
         AGENT.parent.mkdir(parents=True, exist_ok=True)
+        agent = {"Label": "com.dragshift.app", "ProgramArguments": _program(),
+                 "RunAtLoad": True, "ProcessType": "Interactive"}
+        if not getattr(sys, "frozen", False):
+            # launchd starts in "/", where `python -m dragshift` can't find the package
+            agent["WorkingDirectory"] = str(Path(__file__).resolve().parent.parent)
         with open(AGENT, "wb") as f:
-            plistlib.dump({"Label": "com.dragshift.app", "ProgramArguments": _program(),
-                           "RunAtLoad": True, "ProcessType": "Interactive"}, f)
+            plistlib.dump(agent, f)
     elif AGENT.exists():
         AGENT.unlink()
 
